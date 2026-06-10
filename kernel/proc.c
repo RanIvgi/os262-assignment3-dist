@@ -366,6 +366,12 @@ exit(int status)
   if(p == initproc)
     panic("init exiting");
 
+  // If this process called flip_display, the GPU device backing still
+  // points at its physical pages.  Restore the kernel fb[] backing now —
+  // before freeproc/uvmfree later releases those pages — so the device
+  // can never read freed/reused memory.  No-op if not the flip owner.
+  virtio_gpu_release_if_owner(p);
+
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
