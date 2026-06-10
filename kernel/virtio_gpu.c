@@ -134,6 +134,10 @@ struct virtio_gpu_resource_detach_backing
 // can coexist on multi-CPU systems.
 static struct spinlock gpu_lock;
 
+// Serialises virtio_gpu_flip callers so concurrent flips don't clobber
+// the shared attach_buf entry list before the device has consumed it.
+static struct spinlock flip_lock;
+
 static struct
 {
     struct virtq_desc *desc;
@@ -291,7 +295,7 @@ static void gpu_send(void *req, int req_len);
 // ── GPU command helpers ───────────────────────────────────────────────
 
 // Send RESOURCE_DETACH_BACKING for the display resource.
-static void __attribute__((unused))
+static void
 gpu_cmd_detach(void)
 {
     static struct virtio_gpu_resource_detach_backing detach;
@@ -422,6 +426,7 @@ void virtio_gpu_init(void)
 {
     uint32 status = 0;
     initlock(&gpu_lock, "vgpu");
+    initlock(&flip_lock, "vgpu_flip");
 
     // ── 1. VirtIO device handshake ──────────────────────────────────────
     if (*R1(VIRTIO_MMIO_MAGIC_VALUE) != 0x74726976 ||
@@ -546,6 +551,53 @@ void virtio_gpu_init(void)
 void virtio_gpu_commit(void)
 {
     gpu_transfer_flush();
+}
+
+// ── Public: expose kernel framebuffer physical pages ─────────────────
+// Fills out[0..GPU_FB_PAGES-1] with the physical addresses of fb[].
+// In xv6 the kernel direct-maps physical memory, so the void* in fb[]
+// is also the physical address (cast to uint64).
+void
+virtio_gpu_get_fb_pages(uint64 *out)
+{
+    for (int i = 0; i < FB_PAGES; i++)
+        out[i] = (uint64)fb[i];
+}
+
+// ── Public: zero-copy page flip ──────────────────────────────────────
+// Re-point the display resource's backing pages to the n physical pages
+// described by pas[0..n-1].  n must equal GPU_FB_PAGES.  Each entry is
+// PGSIZE long.  Sends RESOURCE_DETACH_BACKING followed by
+// RESOURCE_ATTACH_BACKING.  Returns 0 on success, -1 on bad argument.
+//
+// flip_lock serialises concurrent callers so two flips cannot interleave
+// their writes into the shared attach_buf entry list before gpu_send
+// has finished DMA-ing it to the device.  gpu_send acquires gpu_lock
+// internally, so flip_lock and gpu_lock are always taken in the order
+// flip_lock -> gpu_lock and never the other way round.
+int
+virtio_gpu_flip(uint64 *pas, int n)
+{
+    if (n != FB_PAGES || pas == 0)
+        return -1;
+
+    acquire(&flip_lock);
+
+    // Detach the current backing list, then build and attach the new one
+    // directly into attach_buf (avoids a second 4.7 KiB scratch buffer).
+    gpu_cmd_detach();
+
+    attach_buf.backing.hdr.type   = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach_buf.backing.resource_id = RESOURCE_ID;
+    attach_buf.backing.nr_entries = n;
+    for (int i = 0; i < n; i++) {
+        attach_buf.entries[i].addr   = pas[i];
+        attach_buf.entries[i].length = PGSIZE;
+    }
+    gpu_send(&attach_buf, sizeof(attach_buf));
+
+    release(&flip_lock);
+    return 0;
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────

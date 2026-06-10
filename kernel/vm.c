@@ -269,6 +269,28 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   return newsz;
 }
 
+// Recursively clear any remaining leaf PTEs in `pagetable` without
+// freeing the backing physical pages.  Called from uvmfree so that
+// kernel-owned mappings (e.g. the GPU framebuffer installed by
+// sys_map_display) are torn down without kfree-ing kernel pages and
+// without tripping the "freewalk: leaf" panic below.
+static void
+uvmunmap_leaves_nofree(pagetable_t pagetable)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) == 0)
+      continue;
+    if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // intermediate node — recurse
+      uvmunmap_leaves_nofree((pagetable_t)PTE2PA(pte));
+    } else {
+      // leaf — clear PTE without freeing the physical page
+      pagetable[i] = 0;
+    }
+  }
+}
+
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
 void
@@ -296,6 +318,9 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 {
   if(sz > 0)
     uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+  // Drop any remaining leaf mappings (e.g. mapped framebuffer pages
+  // installed above p->sz) without freeing their physical pages.
+  uvmunmap_leaves_nofree(pagetable);
   freewalk(pagetable);
 }
 
