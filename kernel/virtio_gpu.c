@@ -151,12 +151,6 @@ static struct
 
 static void *fb[FB_PAGES];
 
-// Current "flip owner": the process whose physical pages the device is
-// currently reading from after a successful virtio_gpu_flip().  NULL when
-// the device backing is the kernel-owned fb[] (the safe default set up in
-// virtio_gpu_init).  Guarded by flip_lock.
-static struct proc *flip_owner = 0;
-
 // ── RESOURCE_ATTACH_BACKING command buffer (header + all entries) ────
 
 static struct
@@ -602,51 +596,8 @@ virtio_gpu_flip(uint64 *pas, int n)
     }
     gpu_send(&attach_buf, sizeof(attach_buf));
 
-    // Record the calling process as the flip owner so that if it exits
-    // while the device is still reading from its pages we can restore
-    // the safe kernel fb[] backing before the pages are freed.
-    flip_owner = myproc();
-
     release(&flip_lock);
     return 0;
-}
-
-// ── Public: restore the kernel fb[] backing if `p` is the flip owner ──
-// Called from exit() before the process's user pages are freed.  If the
-// device backing is currently pointing at `p`'s pages, re-attach the
-// kernel-owned fb[] pages (the same backing virtio_gpu_init installed)
-// and clear the owner.  No-op if `p` is not the current flip owner.
-//
-// Locking: flip_lock then gpu_lock (gpu_lock is taken inside gpu_send).
-// Same order as virtio_gpu_flip — never the reverse.  The display daemon
-// only takes gpu_lock, never flip_lock, so there is no inversion path.
-void
-virtio_gpu_release_if_owner(struct proc *p)
-{
-    if (p == 0)
-        return;
-
-    acquire(&flip_lock);
-    if (flip_owner != p) {
-        release(&flip_lock);
-        return;
-    }
-
-    // Mirror virtio_gpu_init's RESOURCE_ATTACH_BACKING step: rebuild the
-    // entry list from the kernel fb[] page pointers and re-attach.
-    gpu_cmd_detach();
-
-    attach_buf.backing.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
-    attach_buf.backing.resource_id = RESOURCE_ID;
-    attach_buf.backing.nr_entries  = FB_PAGES;
-    for (int i = 0; i < FB_PAGES; i++) {
-        attach_buf.entries[i].addr   = (uint64)fb[i];
-        attach_buf.entries[i].length = PGSIZE;
-    }
-    gpu_send(&attach_buf, sizeof(attach_buf));
-
-    flip_owner = 0;
-    release(&flip_lock);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────
