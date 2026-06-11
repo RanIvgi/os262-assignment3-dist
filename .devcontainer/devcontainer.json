@@ -4,9 +4,8 @@
 	"name": "Debian",
 	"build": {
 		"dockerfile": "Dockerfile",
-		// Update 'VARIANT' to pick an Debian version: bullseye, buster
-		// Use bullseye on local arm64/Apple Silicon.
-		"args": { "VARIANT": "bullseye" }
+		// Debian version: bookworm (required on arm64/Apple Silicon — buster has no arm64 manifest, bullseye apt mirrors 404 on the riscv toolchain).
+		"args": { "VARIANT": "bookworm" }
 	},
 
 	// Set *default* container specific settings.json values on container create.
