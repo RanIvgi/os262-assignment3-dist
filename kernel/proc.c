@@ -380,6 +380,12 @@ exit(int status)
   end_op();
   p->cwd = 0;
 
+  // If this process is the current GPU flip owner, copy its flipped
+  // framebuffer into the kernel-owned fb[] and re-attach the device
+  // to fb[] BEFORE its user pages are freed.  This preserves the
+  // displayed image and prevents DMA from freed/reused pages.
+  virtio_gpu_release_if_owner(p);
+
   acquire(&wait_lock);
 
   // Give any children to init.

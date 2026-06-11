@@ -138,6 +138,14 @@ static struct spinlock gpu_lock;
 // the shared attach_buf entry list before the device has consumed it.
 static struct spinlock flip_lock;
 
+// Tracks which process (if any) currently owns the GPU resource backing
+// because it called virtio_gpu_flip().  When that process exits, we
+// must (a) copy its last flipped buffer into the kernel-owned fb[] so
+// the displayed image is preserved, and (b) re-attach the device to
+// fb[] so the GPU never DMAs from pages that have been freed and
+// potentially reused by another process.  Guarded by flip_lock.
+static struct proc *flip_owner;
+
 static struct
 {
     struct virtq_desc *desc;
@@ -596,8 +604,68 @@ virtio_gpu_flip(uint64 *pas, int n)
     }
     gpu_send(&attach_buf, sizeof(attach_buf));
 
+    // Remember the flip owner so that on its exit we can copy its
+    // contents into fb[] and re-attach fb[] before the pages are
+    // freed and reused by another process.
+    flip_owner = myproc();
+
     release(&flip_lock);
     return 0;
+}
+
+// Called from exit() (proc.c) BEFORE the exiting process's user pages
+// are freed by uvmfree().  If the exiting process is the current GPU
+// flip owner, copy the contents of its flipped buffer into the kernel
+// fb[] pages and re-attach the device to fb[].  This preserves the
+// displayed image (so show_flip's text persists after exit, satisfying
+// Task 2's "appears immediately" requirement) AND prevents the device
+// from DMA-reading pages that have been returned to the kalloc free
+// list (Q5 hazard).
+//
+// Locking: takes flip_lock then (via gpu_send) gpu_lock — same order as
+// virtio_gpu_flip, never reversed.  Idempotent: re-entry is a no-op
+// because flip_owner is cleared.
+void
+virtio_gpu_release_if_owner(struct proc *p)
+{
+    acquire(&flip_lock);
+    if (flip_owner != p) {
+        release(&flip_lock);
+        return;
+    }
+
+    // 1. Copy the (still-mapped) user phys pages into the kernel fb[]
+    //    pages.  attach_buf.entries[i].addr holds the user phys addr
+    //    that was installed by virtio_gpu_flip; xv6 direct-maps phys
+    //    so we can dereference it as a pointer.  fb[i] is also a
+    //    direct-mapped kernel page.
+    for (int i = 0; i < FB_PAGES; i++) {
+        void *src = (void *)(uint64)attach_buf.entries[i].addr;
+        memmove(fb[i], src, PGSIZE);
+    }
+
+    // 2. Re-point the GPU resource at the kernel fb[] pages so that
+    //    when this process's user pages are freed shortly after, the
+    //    device backing list no longer references them.
+    static struct virtio_gpu_mem_entry fb_entries[FB_PAGES];
+    for (int i = 0; i < FB_PAGES; i++) {
+        fb_entries[i].addr   = (uint64)fb[i];
+        fb_entries[i].length = PGSIZE;
+        fb_entries[i].padding = 0;
+    }
+    gpu_cmd_detach();
+    gpu_cmd_attach(fb_entries, FB_PAGES);
+
+    // 3. Force an immediate TRANSFER_TO_HOST_2D + RESOURCE_FLUSH so the
+    //    just-copied fb[] content is shown right away, instead of
+    //    waiting for the next display_daemon tick.  Without this the
+    //    host display keeps showing whatever it had when the previous
+    //    backing was attached, which can be stale gol/show_flip
+    //    content even after fb[] has been correctly updated.
+    gpu_transfer_flush();
+
+    flip_owner = 0;
+    release(&flip_lock);
 }
 
 // ── GPU daemon ────────────────────────────────────────────────────────
